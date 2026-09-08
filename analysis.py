@@ -27,10 +27,15 @@ def load_tourism_data(file_path):
     all_data = []
     
     for sheet in monthly_sheets:
+        print(f"  Загрузка листа {sheet}...")
         df = pd.read_excel(file_path, sheet_name=sheet, header=None)
         
         # Ищем строку с "Российская Федерация"
-        start_row = df[df[0] == 'Российская Федерация'].index[0]
+        try:
+            start_row = df[df[0] == 'Российская Федерация'].index[0]
+        except IndexError:
+            print(f"    Не найден регион 'Российская Федерация' на листе {sheet}")
+            continue
         
         df_data = pd.read_excel(
             file_path, 
@@ -53,8 +58,14 @@ def load_tourism_data(file_path):
         months = [str(m).strip() for m in months_df.iloc[0, 1:].values if pd.notna(m)]
         data_values = df_data.iloc[:, 1:].values
         
+        # Обрезаем до количества месяцев
+        if len(months) < data_values.shape[1]:
+            data_values = data_values[:, :len(months)]
+        elif len(months) > data_values.shape[1]:
+            months = months[:data_values.shape[1]]
+        
         df_monthly = pd.DataFrame(data_values, columns=months)
-        df_monthly['Регион'] = regions
+        df_monthly['Регион'] = regions[:len(df_monthly)]
         df_monthly['Год'] = int(sheet.split('.')[1])
         df_monthly = df_monthly.dropna(subset=['Регион'])
         
@@ -71,11 +82,23 @@ def load_tourism_data(file_path):
             'январь-октябрь*': 10, 'январь-ноябрь*': 11, 'январь-декабрь*': 12
         }
         df_melted['Месяц_номер'] = df_melted['Месяц'].map(month_map)
+        
+        # Убираем строки с NaN в месяце
+        df_melted = df_melted.dropna(subset=['Месяц_номер'])
+        
+        # Преобразуем в целые числа
+        df_melted['Месяц_номер'] = df_melted['Месяц_номер'].astype(int)
+        df_melted['Год'] = df_melted['Год'].astype(int)
+        
+        # Создаем дату
         df_melted['Дата'] = pd.to_datetime(
             df_melted['Год'].astype(str) + '-' + df_melted['Месяц_номер'].astype(str) + '-01'
         )
         
         all_data.append(df_melted)
+    
+    if not all_data:
+        raise ValueError("Не удалось загрузить данные ни с одного листа!")
     
     df_all = pd.concat(all_data, ignore_index=True)
     df_all = df_all.dropna(subset=['Поездки'])
@@ -83,6 +106,20 @@ def load_tourism_data(file_path):
     df_all = df_all[~df_all['Регион'].str.contains('К содержанию|NaN', na=False)]
     df_all = df_all[df_all['Регион'] != '']
     
+    # Убираем строки, где регион - это федеральные округа
+    federal_districts = [
+        'Центральный федеральный округ',
+        'Северо-Западный федеральный округ',
+        'Южный федеральный округ',
+        'Северо-Кавказский федеральный округ',
+        'Приволжский федеральный округ',
+        'Уральский федеральный округ',
+        'Сибирский федеральный округ',
+        'Дальневосточный федеральный округ'
+    ]
+    df_all = df_all[~df_all['Регион'].isin(federal_districts)]
+    
+    print(f"  Загружено {len(df_all)} записей")
     return df_all
 
 
@@ -93,8 +130,6 @@ def load_tourism_data(file_path):
 def get_regions(df_all, top_n=None):
     """
     Возвращает список регионов для анализа
-    - top_n=None: все регионы
-    - top_n=10: ТОП-10 регионов
     """
     df_2025 = df_all[df_all['Год'] == 2025].copy()
     region_total = df_2025.groupby('Регион')['Поездки'].sum().sort_values(ascending=False)
@@ -110,7 +145,7 @@ def get_regions(df_all, top_n=None):
         print(f"ТОП-{top_n} РЕГИОНОВ ПО ТУРПОТОКУ ЗА 2025 ГОД")
         print(f"{'='*60}")
     
-    for i, region in enumerate(regions[:20], 1):  # Показываем первые 20
+    for i, region in enumerate(regions[:20], 1):
         total = region_total[region]
         print(f"{i:2d}. {region:<35} {total:>12,.0f} поездок")
     
@@ -121,7 +156,7 @@ def get_regions(df_all, top_n=None):
 
 
 # ============================================================
-# 3. ФИЛЬТРАЦИЯ И ПОДГОТОВКА ДАННЫХ
+# 3. ФИЛЬТРАЦИЯ
 # ============================================================
 
 def filter_regions_data(df_all, regions):
@@ -136,7 +171,7 @@ def filter_regions_data(df_all, regions):
 
 
 # ============================================================
-# 4. ОЧИСТКА ДАННЫХ
+# 4. ОЧИСТКА ДАННЫХ (ИСПРАВЛЕННАЯ)
 # ============================================================
 
 def clean_data(df_filtered):
@@ -145,25 +180,34 @@ def clean_data(df_filtered):
     """
     df_clean = df_filtered.copy()
     
-    # Пропуски
+    # Проверка пропусков
     missing = df_clean.isnull().sum()
     if missing.sum() > 0:
         print(f"\nПропуски в данных:\n{missing[missing > 0]}")
     
-    # Интерполяция
-    df_clean = df_clean.set_index(['Регион', 'Дата']).sort_index()
-    df_clean['Поездки'] = df_clean.groupby('Регион')['Поездки'].transform(
-        lambda x: x.interpolate(method='time', limit_direction='both')
-    )
-    df_clean = df_clean.reset_index()
+    # ИСПРАВЛЕНО: Интерполяция через группировку с линейным методом
+    def interpolate_group(group):
+        """Интерполяция для каждой группы"""
+        return group.interpolate(method='linear', limit_direction='both')
     
-    # Выбросы
+    # Сбрасываем индекс, группируем и интерполируем
+    df_clean = df_clean.sort_values(['Регион', 'Дата'])
+    
+    # Интерполяция по каждой группе
+    df_clean['Поездки'] = df_clean.groupby('Регион')['Поездки'].transform(
+        lambda x: x.interpolate(method='linear', limit_direction='both')
+    )
+    
+    # Если остались пропуски (например, весь ряд пустой), заполняем нулями
+    df_clean['Поездки'] = df_clean['Поездки'].fillna(0)
+    
+    # Выбросы (IQR метод)
     def detect_outliers(group):
         Q1 = group.quantile(0.25)
         Q3 = group.quantile(0.75)
         IQR = Q3 - Q1
         lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q1 + 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
         return (group < lower_bound) | (group > upper_bound)
     
     df_clean['is_outlier'] = df_clean.groupby('Регион')['Поездки'].transform(detect_outliers)
@@ -171,7 +215,7 @@ def clean_data(df_filtered):
     # Feature Engineering
     df_clean = df_clean.sort_values(['Регион', 'Дата'])
     
-    # Лаги
+    # Лаговые значения
     for lag in [1, 3, 6, 12]:
         df_clean[f'lag_{lag}'] = df_clean.groupby('Регион')['Поездки'].shift(lag)
     
@@ -187,7 +231,7 @@ def clean_data(df_filtered):
     df_clean['год'] = df_clean['Дата'].dt.year
     df_clean['день_года'] = df_clean['Дата'].dt.dayofyear
     
-    # Праздники
+    # Признаки праздников
     holiday_months = [1, 2, 3, 5, 12]
     df_clean['is_holiday_month'] = df_clean['месяц'].isin(holiday_months).astype(int)
     
@@ -205,14 +249,13 @@ def clean_data(df_filtered):
 
 
 # ============================================================
-# 5. ВИЗУАЛИЗАЦИЯ (адаптировано для всех регионов)
+# 5. ВИЗУАЛИЗАЦИЯ
 # ============================================================
 
 def plot_trends_and_seasonality(df_clean, top_n=10):
     """
     Визуализация трендов и сезонности
     """
-    # Берем только ТОП-N для читаемости графиков
     top_regions = df_clean.groupby('Регион')['Поездки'].sum().nlargest(top_n).index
     
     fig, axes = plt.subplots(2, 1, figsize=(15, 10))
@@ -250,7 +293,6 @@ def plot_regional_comparison(df_clean, top_n=10):
     """
     Сравнительный анализ регионов
     """
-    # Берем ТОП-N
     top_regions = df_clean.groupby('Регион')['Поездки'].sum().nlargest(top_n).index
     df_top = df_clean[df_clean['Регион'].isin(top_regions)]
     
@@ -299,7 +341,6 @@ def plot_all_regions_summary(df_clean):
     """
     Сводный график для всех регионов
     """
-    # Суммарный турпоток по месяцам
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
     # 1. Общий тренд по России
@@ -338,6 +379,33 @@ def plot_all_regions_summary(df_clean):
     plt.show()
 
 
+def plot_decomposition(df_clean, region):
+    """
+    Декомпозиция временного ряда для региона
+    """
+    data = df_clean[df_clean['Регион'] == region].copy()
+    if len(data) < 24:
+        print(f"  Недостаточно данных для декомпозиции {region}")
+        return
+    
+    data = data.set_index('Дата').sort_index()
+    
+    try:
+        decomposition = seasonal_decompose(data['Поездки'], model='additive', period=12)
+        
+        fig, axes = plt.subplots(4, 1, figsize=(15, 12))
+        
+        decomposition.observed.plot(ax=axes[0], title=f'Исходный ряд - {region}')
+        decomposition.trend.plot(ax=axes[1], title='Тренд')
+        decomposition.seasonal.plot(ax=axes[2], title='Сезонность')
+        decomposition.resid.plot(ax=axes[3], title='Остатки')
+        
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"  Ошибка декомпозиции для {region}: {e}")
+
+
 # ============================================================
 # 6. СТАТИСТИКА
 # ============================================================
@@ -362,7 +430,7 @@ def get_region_statistics(df_clean, top_n=None):
     print("\n" + "="*60)
     print("СТАТИСТИКА ПО РЕГИОНАМ")
     print("="*60)
-    print(stats.round(0))
+    print(stats.round(0).head(20))
     
     return stats
 
@@ -377,7 +445,6 @@ def seasonal_analysis(df_clean, top_n=None):
     else:
         df_analysis = df_clean
     
-    # Пики
     monthly_avg = df_analysis.groupby(['Регион', 'месяц'])['Поездки'].mean().reset_index()
     peak_months = monthly_avg.loc[
         monthly_avg.groupby('Регион')['Поездки'].idxmax()
@@ -388,19 +455,18 @@ def seasonal_analysis(df_clean, top_n=None):
     print("="*60)
     month_names = {1:'Янв',2:'Фев',3:'Мар',4:'Апр',5:'Май',6:'Июн',
                    7:'Июл',8:'Авг',9:'Сен',10:'Окт',11:'Ноя',12:'Дек'}
-    for region, month in peak_months.iterrows():
-        print(f"{region:<35} → пик в {month_names[month['месяц']]}")
+    for region, month in peak_months.head(20).iterrows():
+        print(f"{region[:35]:<35} → пик в {month_names[month['месяц']]}")
     
-    # Лето/Зима
     summer_avg = df_analysis[df_analysis['месяц'].isin([6,7,8])].groupby('Регион')['Поездки'].mean()
     winter_avg = df_analysis[df_analysis['месяц'].isin([12,1,2])].groupby('Регион')['Поездки'].mean()
     ratio = (summer_avg / winter_avg).sort_values(ascending=False)
     
     print("\n" + "="*60)
-    print("СООТНОШЕНИЕ ЛЕТО/ЗИМА (только для ненулевых значений)")
+    print("СООТНОШЕНИЕ ЛЕТО/ЗИМА")
     print("="*60)
     for region, r in ratio.dropna().head(10).items():
-        print(f"{region:<35} → летом в {r:.1f}x больше туристов, чем зимой")
+        print(f"{region[:35]:<35} → летом в {r:.1f}x больше туристов, чем зимой")
 
 
 # ============================================================
@@ -410,8 +476,6 @@ def seasonal_analysis(df_clean, top_n=None):
 def run_full_analysis(file_path, top_n=None):
     """
     Запускает полный анализ
-    - top_n=None: все регионы
-    - top_n=10: ТОП-10 регионов
     """
     print("="*60)
     print("АНАЛИЗ ТУРИСТИЧЕСКОГО ПОТОКА РОССИИ")
@@ -445,14 +509,15 @@ def run_full_analysis(file_path, top_n=None):
     if top_n is not None:
         plot_trends_and_seasonality(df_clean, top_n)
         plot_regional_comparison(df_clean, top_n)
+        if len(regions) > 0:
+            plot_decomposition(df_clean, regions[0])
     else:
-        # Для всех регионов показываем сводный график
         plot_all_regions_summary(df_clean)
-        # И ТОП-10 для детального просмотра
         plot_trends_and_seasonality(df_clean, top_n=10)
         plot_regional_comparison(df_clean, top_n=10)
+        if len(regions) > 0:
+            plot_decomposition(df_clean, regions[0])
     
-    # Сезонный анализ
     seasonal_analysis(df_clean, top_n=min(20, len(df_clean['Регион'].unique())))
     
     # Сохранение
@@ -474,9 +539,9 @@ def run_full_analysis(file_path, top_n=None):
 if __name__ == "__main__":
     FILE_PATH = 'Turpotok_1kv-2026.xlsx'
     
-    # ===== ВЫБЕРИТЕ РЕЖИМ =====
-    # Вариант 1: Все регионы
-    df_clean, regions, stats = run_full_analysis(FILE_PATH, top_n=None)
+    # Выберите режим:
+    # top_n=None — все регионы
+    # top_n=10 — только ТОП-10
     
-    # Вариант 2: Только ТОП-10 (закомментируйте верхний и раскомментируйте этот)
+    df_clean, regions, stats = run_full_analysis(FILE_PATH, top_n=None)
     # df_clean, regions, stats = run_full_analysis(FILE_PATH, top_n=10)
